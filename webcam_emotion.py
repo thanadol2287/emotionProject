@@ -8,7 +8,7 @@ import os
 # =========================
 # Config
 # =========================
-MODEL_PATH = "FER2013_best_model.keras"   # ✅ ไฟล์ .keras
+MODEL_PATH = "FER2013_best_modelV2.keras"   # ✅ ไฟล์ .keras
 CAM_INDEX = 0
 
 emotion_labels = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
