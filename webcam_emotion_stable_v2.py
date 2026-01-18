@@ -8,39 +8,65 @@ import os
 # =========================
 # Config
 # =========================
-MODEL_PATH = "FER2013_best_modelV2.keras"   # .keras
+MODEL_PATH = "FER2013_best_model V3.keras"   # .keras (ไฟล์อยู่โฟลเดอร์เดียวกับสคริปต์)
 CAM_INDEX = 0
 
 emotion_labels = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
 
-# prediction smoothing
-SMOOTH = 6
-HOLD_FRAMES = 3
+# =========================
+# Smoothing + Stability tuning
+# =========================
+SMOOTH = 6                 # moving average window
 pred_q = deque(maxlen=SMOOTH)
+
+PROB_EMA = 0.75            # EMA บนเวกเตอร์ prob (ยิ่งสูงยิ่งนิ่ง)
+SWITCH_MARGIN = 0.05       # ต้องชนะอันดับ 2 ห่างพอ ถึงจะสลับ
+GAP_MIN = 0.03             # กันการสลับตอนคะแนนใกล้กันมาก
+
+# เข้า/ออก คนละ threshold (Schmitt trigger)
+ENTER_THRESH = {
+    "happy": 0.14,
+    "surprise": 0.18,
+    "sad": 0.22,
+    "neutral": 0.00,
+    "angry": 0.20,
+    "fear": 0.20,
+    "disgust": 0.14
+}
+EXIT_THRESH = {
+    "happy": 0.08,
+    "surprise": 0.10,
+    "sad": 0.12,
+    "neutral": 0.00,
+    "angry": 0.10,
+    "fear": 0.12,
+    "disgust": 0.06
+}
+
+# HOLD แยกตามคลาส (angry/disgust ให้หนึบขึ้น)
+HOLD = {
+    "angry": 5,
+    "disgust": 6,
+    "fear": 4,
+    "sad": 3,
+    "happy": 3,
+    "surprise": 3,
+    "neutral": 2
+}
 
 current_label = "neutral"
 pending_label = None
 pending_count = 0
 
+# preprocessing
 PREPROCESS_MODE = "rescale"  # "rescale" or "zscore"
-
-THRESH = {
-    "happy": 0.12,
-    "surprise": 0.15,
-    "sad": 0.20,
-    "neutral": 0.00,
-    "angry": 0.14,
-    "fear": 0.18,
-    "disgust": 0.08
-}
-GAP_MIN = 0.02
 
 # =========================
 # Face stability config
 # =========================
-DETECT_EVERY = 6          # run cascade every N frames
-TRACKER_TYPE = "CSRT"    # "CSRT" (best) or "KCF" (faster)
-BBOX_SMOOTH = 0.75        # EMA: closer to 1 = smoother (less jitter)
+DETECT_EVERY = 6           # run cascade every N frames
+TRACKER_TYPE = "CSRT"      # "CSRT" (best) or "KCF" (faster)
+BBOX_SMOOTH = 0.75         # EMA: closer to 1 = smoother (less jitter)
 MIN_FACE = (90, 90)
 
 # CLAHE helps in bad lighting (for detection & ROI)
@@ -78,7 +104,6 @@ if len(emotion_labels) != num_classes:
 # =========================
 # Helpers
 # =========================
-
 def preprocess_face(gray_roi_48):
     roi = gray_roi_48.astype("float32")
     if PREPROCESS_MODE == "zscore":
@@ -88,7 +113,6 @@ def preprocess_face(gray_roi_48):
     roi = roi.reshape(1, 48, 48, 1)
     return tf.convert_to_tensor(roi, dtype=tf.float32)
 
-
 def to_probs(vec):
     vec = np.asarray(vec, dtype=np.float32)
     s = float(np.sum(vec))
@@ -97,25 +121,17 @@ def to_probs(vec):
         vec = e / (np.sum(e) + 1e-8)
     return vec
 
-
 def pick_biggest_face(faces):
     if len(faces) == 0:
         return None
     areas = [w * h for (x, y, w, h) in faces]
     return faces[int(np.argmax(areas))]
 
-
 def make_tracker():
-    """Create an OpenCV tracker if available.
-
-    Note: CSRT/KCF trackers require opencv-contrib-python (or are under cv2.legacy
-    in some OpenCV versions). If unavailable, return None and we will fall back
-    to running face detection more often.
-    """
+    """Create an OpenCV tracker if available (needs opencv-contrib-python)."""
     t = TRACKER_TYPE.upper()
 
     def _get(name):
-        # OpenCV may expose trackers either at top-level or under cv2.legacy
         if hasattr(cv2, name):
             return getattr(cv2, name)
         if hasattr(cv2, "legacy") and hasattr(cv2.legacy, name):
@@ -127,7 +143,6 @@ def make_tracker():
         "KCF": _get("TrackerKCF_create"),
         "MOSSE": _get("TrackerMOSSE_create"),
     }
-
     creator = creators.get(t) or creators.get("CSRT") or creators.get("KCF") or creators.get("MOSSE")
     if creator is None:
         print("⚠️ OpenCV tracker not available (need opencv-contrib-python). Falling back to detection-only mode.")
@@ -135,7 +150,6 @@ def make_tracker():
     return creator()
 
 def ema_bbox(prev, new, a=BBOX_SMOOTH):
-    # prev/new are (x, y, w, h)
     if prev is None:
         return new
     px, py, pw, ph = prev
@@ -146,6 +160,13 @@ def ema_bbox(prev, new, a=BBOX_SMOOTH):
     h = int(a * ph + (1 - a) * nh)
     return (x, y, w, h)
 
+def reset_state():
+    """Reset prediction state when face is lost / ROI invalid."""
+    global pending_label, pending_count, p_ema
+    pred_q.clear()
+    pending_label = None
+    pending_count = 0
+    p_ema = None
 
 # =========================
 # Webcam
@@ -164,6 +185,9 @@ tracked_bbox = None   # (x,y,w,h)
 smoothed_bbox = None
 frame_i = 0
 lost_count = 0
+
+# EMA prob state
+p_ema = None
 
 while True:
     ret, frame = cap.read()
@@ -196,7 +220,7 @@ while True:
                 tracker = None
                 tracked_bbox = None
                 smoothed_bbox = None
-                pred_q.clear()
+                reset_state()
 
     # 2) run detection periodically OR when no tracker
     if (tracker is None) or (frame_i % DETECT_EVERY == 0):
@@ -232,7 +256,7 @@ while True:
 
         roi = gray[y1:y2, x1:x2]
         if roi.size == 0:
-            pred_q.clear()
+            reset_state()
             cv2.putText(frame, f"Bad ROI | FPS:{fps:.1f}",
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         else:
@@ -247,33 +271,53 @@ while True:
             pred_q.append(probs)
             p = np.mean(pred_q, axis=0)
 
-            top3 = p.argsort()[-3:][::-1]
+            # --- EMA smoothing on probability vector ---
+            if p_ema is None:
+                p_ema = p.copy()
+            else:
+                p_ema = PROB_EMA * p_ema + (1.0 - PROB_EMA) * p
+
+            top3 = p_ema.argsort()[-3:][::-1]
             i1, i2, i3 = [int(i) for i in top3]
             label1, label2, label3 = [emotion_labels[i] for i in top3]
-            conf1, conf2, conf3 = float(p[i1]), float(p[i2]), float(p[i3])
+            conf1, conf2, conf3 = float(p_ema[i1]), float(p_ema[i2]), float(p_ema[i3])
             gap = conf1 - conf2
 
-            proposed = label1 if conf1 >= THRESH.get(label1, 0.18) else "neutral"
+            # current prob
+            cur_idx = emotion_labels.index(current_label) if current_label in emotion_labels else None
+            cur_p = float(p_ema[cur_idx]) if cur_idx is not None else 0.0
 
-            # angry override (anti sad swallowing angry)
+            # --- Schmitt trigger decision ---
+            want_switch = (conf1 >= ENTER_THRESH.get(label1, 0.18)) and (gap >= SWITCH_MARGIN)
+            stay_ok = (cur_p >= EXIT_THRESH.get(current_label, 0.0))
+
+            if current_label != "neutral" and stay_ok:
+                proposed = current_label
+            else:
+                proposed = label1 if want_switch else "neutral"
+
+            # --- Anti sad swallowing angry ---
             if (
                 label1 == "sad" and label2 == "angry"
-                and conf1 > 0.80 and conf2 > 0.02
+                and conf2 >= ENTER_THRESH.get("angry", 0.20)
+                and gap < 0.12
             ):
                 proposed = "angry"
 
-            # disgust rescue
-            if (
-                "disgust" in [label1, label2, label3]
-                and conf1 < 0.55
-                and abs(conf1 - conf2) < 0.10
-            ):
-                proposed = "disgust"
+            # --- Disgust rescue ---
+            if "disgust" in [label1, label2, label3] and "disgust" in emotion_labels:
+                d_idx = emotion_labels.index("disgust")
+                d_p = float(p_ema[d_idx])
+                if d_p >= ENTER_THRESH.get("disgust", 0.14) and (abs(d_p - conf1) <= 0.10):
+                    proposed = "disgust"
 
+            # --- GAP guard ---
             if proposed != "neutral" and gap < GAP_MIN:
                 proposed = current_label
 
-            # HOLD frames
+            # --- HOLD frames (per-class) ---
+            need_hold = HOLD.get(proposed, 3)
+
             if proposed == current_label:
                 pending_label = None
                 pending_count = 0
@@ -283,7 +327,8 @@ while True:
                     pending_count = 1
                 else:
                     pending_count += 1
-                if pending_count >= HOLD_FRAMES:
+
+                if pending_count >= need_hold:
                     current_label = proposed
                     pending_label = None
                     pending_count = 0
@@ -301,7 +346,7 @@ while True:
             )
 
     else:
-        pred_q.clear()
+        reset_state()
         cv2.putText(frame, f"No face | FPS:{fps:.1f}",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
